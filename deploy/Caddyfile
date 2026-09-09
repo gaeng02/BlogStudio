@@ -1,0 +1,12 @@
+{$STUDIO_ORIGIN_HOST} {
+    request_body {
+        max_size 6MB
+    }
+    @studio path /studio /studio/*
+    handle @studio {
+        reverse_proxy studio:8000
+    }
+    handle {
+        respond 404
+    }
+}
