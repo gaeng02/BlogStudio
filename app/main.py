@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import logging
+import re
 import secrets
 import time
 import uuid
@@ -10,6 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Annotated
+from urllib.parse import unquote, urlsplit
 
 from authlib.integrations.base_client import OAuthError
 from authlib.integrations.starlette_client import OAuth
@@ -21,7 +23,7 @@ from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
 from .config import Settings
-from .content import PostInput, parse_post
+from .content import CATEGORY_DIRS, PostInput, category_from_path, parse_post, slug_from_path
 from .db import Database
 from .github import GitHub, GitHubError, article_entries
 from .publishing import public_draft, publish
@@ -42,7 +44,28 @@ class RevisionInput(BaseModel):
 
 
 class ImportInput(BaseModel):
-    path: str = Field(max_length=1000)
+    path: str = Field(default="", max_length=1000)
+    url: str = Field(default="", max_length=1000)
+
+
+def path_date(path: str) -> str | None:
+    match = re.match(r"(\d{4}-\d{2}-\d{2})-", path.rsplit("/", 1)[-1])
+    return match[1] if match else None
+
+
+def resolve_public_url(url: str, blog_url: str) -> tuple[str, str]:
+    """Map a public article address (full URL or /category/slug) to its category and slug."""
+    parts = urlsplit(url.strip())
+    if parts.scheme or parts.netloc:
+        blog = urlsplit(blog_url)
+        if parts.scheme != blog.scheme or parts.netloc.lower() != blog.netloc.lower():
+            raise HTTPException(400, f"{blog.netloc}의 글 주소만 불러올 수 있습니다.")
+    segments = [unquote(segment) for segment in parts.path.strip("/").split("/") if segment]
+    if len(segments) != 2 or segments[0] not in CATEGORY_DIRS or not segments[1]:
+        raise HTTPException(
+            400, "글 주소는 /카테고리/글주소 형식이어야 합니다. 예: /memoir/2025-03-SWMaestro"
+        )
+    return segments[0], segments[1]
 
 
 def allowed_identity(user: dict, settings: Settings) -> bool:
@@ -114,7 +137,9 @@ def create_app(settings: Settings, github=None):
         response.headers["Referrer-Policy"] = "same-origin"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "default-src 'self'; script-src 'self'; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src 'self' https://fonts.gstatic.com; "
             "img-src 'self' https: data: blob:; connect-src 'self'; frame-ancestors 'none'; "
             "base-uri 'self'; form-action 'self'"
         )
@@ -257,6 +282,22 @@ def create_app(settings: Settings, github=None):
                     raise HTTPException(409, "다른 창에서 초안이 바뀌었습니다. 새로 불러와 주세요.")
             return public_draft(db.draft(draft_id))
 
+    @app.delete(PREFIX + "/api/drafts/{draft_id}", dependencies=[Depends(session)])
+    async def delete_draft(draft_id: str):
+        async with lock:
+            draft = db.draft(draft_id)
+            if not draft:
+                raise HTTPException(404, "초안을 찾지 못했습니다.")
+            if draft["pending"]:
+                raise HTTPException(
+                    409, "앞선 발행 결과를 확인해야 합니다. 발행 버튼을 다시 누른 뒤 삭제해 주세요."
+                )
+            # Only the private copy goes away; a published article stays on GitHub.
+            with db.connect() as connection:
+                connection.execute("DELETE FROM assets WHERE draft_id=?", (draft_id,))
+                connection.execute("DELETE FROM drafts WHERE id=?", (draft_id,))
+            return {"ok": True, "source_path": draft["source_path"]}
+
     @app.post(PREFIX + "/api/drafts/{draft_id}/publish", dependencies=[Depends(session)])
     async def publish_draft(draft_id: str, data: RevisionInput):
         async with lock:
@@ -283,15 +324,10 @@ def create_app(settings: Settings, github=None):
             backup["slug"] = ""  # A backup must not accidentally publish over an existing URL.
             backup_id = str(uuid.uuid4())
             now = datetime.now(UTC).isoformat()
-            copied_assets = []
-            for asset in db.assets(draft_id):
-                name = f"studio-{uuid.uuid4().hex}.{asset['name'].rsplit('.', 1)[-1]}"
-                old_path = f"/assets/images/{asset['name']}"
-                new_path = f"/assets/images/{name}"
-                backup["body"] = backup["body"].replace(old_path, new_path)
-                if backup["cover"] == old_path:
-                    backup["cover"] = new_path
-                copied_assets.append((name, backup_id, asset["mime"], asset["data"]))
+            # Names are content hashes, so the backup keeps the same image paths in its body.
+            copied_assets = [
+                (asset["name"], backup_id, asset["mime"], asset["data"]) for asset in db.assets(draft_id)
+            ]
             with db.connect() as connection:
                 connection.execute(
                     "INSERT INTO drafts (id,revision,post,updated_at) VALUES (?,1,?,?)",
@@ -312,47 +348,74 @@ def create_app(settings: Settings, github=None):
             return {"draft": public_draft(db.draft(draft_id)), "backup": public_draft(db.draft(backup_id))}
 
     @app.get(PREFIX + "/api/posts", dependencies=[Depends(session)])
-    async def posts():
+    async def posts(category: str = ""):
+        """List published articles from the Git tree alone. Titles are read only for one
+        requested category, so opening the browser never downloads every article."""
+        if category and category not in CATEGORY_DIRS:
+            raise HTTPException(400, "허용되지 않은 카테고리입니다.")
         _, _, tree = await github.snapshot()
-        result = []
-        semaphore = asyncio.Semaphore(5)
+        entries = [
+            (path, entry)
+            for path, entry in article_entries(tree)
+            if not category or category_from_path(path) == category
+        ]
+        result = [
+            {
+                "path": path,
+                "category": category_from_path(path),
+                "slug": slug_from_path(path),
+                "date": path_date(path),
+                "title": None,
+                "draft": None,
+            }
+            for path, _ in entries
+        ]
+        if category:
+            semaphore = asyncio.Semaphore(5)
 
-        async def load(path, entry):
-            async with semaphore:
-                try:
-                    post, meta = parse_post(path, await github.read_blob(entry["sha"]))
-                    result.append(
-                        {
-                            "path": path,
-                            "title": post.title,
-                            "date": post.date.isoformat(),
-                            "category": post.category,
-                            "draft": meta.get("draft") is True,
-                        }
-                    )
-                except (ValueError, UnicodeError):
-                    result.append({"path": path, "title": path, "error": "지원하지 않는 글 형식"})
+            async def load(item, entry):
+                async with semaphore:
+                    try:
+                        post, meta = parse_post(item["path"], await github.read_blob(entry["sha"]))
+                        item.update(
+                            title=post.title, date=post.date.isoformat(), draft=meta.get("draft") is True
+                        )
+                    except (ValueError, UnicodeError):
+                        item.update(error="지원하지 않는 글 형식")
 
-        await asyncio.gather(*(load(path, entry) for path, entry in article_entries(tree)))
-        return sorted(result, key=lambda post: post.get("date", ""), reverse=True)
+            await asyncio.gather(*(load(item, entry) for item, (_, entry) in zip(result, entries)))
+        return sorted(result, key=lambda item: (item.get("date") or "", item["slug"]), reverse=True)
 
     @app.post(PREFIX + "/api/posts/import", dependencies=[Depends(session)])
     async def import_post(data: ImportInput):
+        if not data.path and not data.url:
+            raise HTTPException(400, "불러올 글의 경로나 주소를 입력해 주세요.")
         async with lock:
+            path = data.path
+            entries = None
+            if not path:
+                category, slug = resolve_public_url(data.url, settings.blog_url)
+                _, _, tree = await github.snapshot()
+                entries = dict(article_entries(tree))
+                path = next(
+                    (p for p in entries if category_from_path(p) == category and slug_from_path(p) == slug),
+                    None,
+                )
+                if not path:
+                    raise HTTPException(404, "해당 주소의 글을 GitHub에서 찾지 못했습니다.")
             # Reopening an edited post resumes its draft; never discard unsaved work.
             with db.connect() as connection:
-                existing = connection.execute(
-                    "SELECT * FROM drafts WHERE source_path=?", (data.path,)
-                ).fetchone()
+                existing = connection.execute("SELECT * FROM drafts WHERE source_path=?", (path,)).fetchone()
             if existing:
                 return public_draft(db.decode(existing))
-            _, _, tree = await github.snapshot()
-            entries = dict(article_entries(tree))
-            if data.path not in entries:
+            if entries is None:
+                _, _, tree = await github.snapshot()
+                entries = dict(article_entries(tree))
+            if path not in entries:
                 raise HTTPException(404, "글을 찾지 못했습니다.")
-            sha = entries[data.path]["sha"]
+            sha = entries[path]["sha"]
             try:
-                post, meta = parse_post(data.path, await github.read_blob(sha))
+                post, meta = parse_post(path, await github.read_blob(sha))
             except (ValueError, UnicodeError) as error:
                 raise HTTPException(400, "글 형식을 확인해 주세요.") from error
             draft_id = str(uuid.uuid4())
@@ -363,7 +426,7 @@ def create_app(settings: Settings, github=None):
                     (
                         draft_id,
                         post.model_dump_json(),
-                        data.path,
+                        path,
                         sha,
                         json.dumps(meta, ensure_ascii=False, default=str),
                         datetime.now(UTC).isoformat(),
@@ -384,7 +447,13 @@ def create_app(settings: Settings, github=None):
                 with Image.open(io.BytesIO(data)) as picture:
                     fmt = picture.format
                     picture.verify()
-            except (UnidentifiedImageError, OSError, SyntaxError, ValueError, Image.DecompressionBombError) as error:
+            except (
+                UnidentifiedImageError,
+                OSError,
+                SyntaxError,
+                ValueError,
+                Image.DecompressionBombError,
+            ) as error:
                 raise HTTPException(400, "이미지 파일을 확인해 주세요.") from error
             formats = {
                 "PNG": ("png", "image/png"),
@@ -395,20 +464,31 @@ def create_app(settings: Settings, github=None):
             if fmt not in formats:
                 raise HTTPException(400, "PNG, JPEG, GIF, WebP 이미지를 지원합니다.")
             extension, mime = formats[fmt]
-            name = f"studio-{uuid.uuid4().hex}.{extension}"
+            # Content-addressed file name: re-uploading the same image yields the same
+            # name, and different images cannot collide or overwrite each other.
+            name = f"{hashlib.sha256(data).hexdigest()[:16]}.{extension}"
             with db.connect() as connection:
-                size = connection.execute(
-                    "SELECT COALESCE(SUM(length(data)),0) FROM assets WHERE draft_id=?", (draft_id,)
-                ).fetchone()[0]
-                if size + len(data) > 25 * 1024 * 1024:
-                    raise HTTPException(413, "초안당 이미지 합계는 25MB까지 지원합니다.")
-                connection.execute("INSERT INTO assets VALUES (?, ?, ?, ?)", (name, draft_id, mime, data))
+                existing = connection.execute(
+                    "SELECT data FROM assets WHERE draft_id=? AND name=?", (draft_id, name)
+                ).fetchone()
+                if existing and existing["data"] != data:  # astronomically unlikely prefix collision
+                    name = f"{hashlib.sha256(data).hexdigest()}.{extension}"
+                    existing = None
+                if not existing:
+                    size = connection.execute(
+                        "SELECT COALESCE(SUM(length(data)),0) FROM assets WHERE draft_id=?", (draft_id,)
+                    ).fetchone()[0]
+                    if size + len(data) > 25 * 1024 * 1024:
+                        raise HTTPException(413, "초안당 이미지 합계는 25MB까지 지원합니다.")
+                    connection.execute(
+                        "INSERT INTO assets (name, draft_id, mime, data) VALUES (?, ?, ?, ?)",
+                        (name, draft_id, mime, data),
+                    )
             return {"path": f"/assets/images/{name}", "preview": PREFIX + f"/api/assets/{name}"}
 
     @app.get(PREFIX + "/api/assets/{name}", dependencies=[Depends(session)])
     def image(name: str):
-        with db.connect() as connection:
-            asset = connection.execute("SELECT * FROM assets WHERE name=?", (name,)).fetchone()
+        asset = db.asset(name)
         if not asset:
             raise HTTPException(404)
         return Response(asset["data"], media_type=asset["mime"])

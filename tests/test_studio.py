@@ -1,6 +1,8 @@
 import base64
 import hashlib
 import io
+import re
+import sqlite3
 import time
 
 import pytest
@@ -36,6 +38,11 @@ class FakeGitHub:
         self.lose_response = False
         self.move_before_advance = False
         self.blobs = {blob_sha(data): data for data in self.files.values()}
+        self.reads = 0
+
+    def add_file(self, path, data):
+        self.files[path] = data
+        self.blobs[blob_sha(data)] = data
 
     async def snapshot(self):
         return (
@@ -48,6 +55,7 @@ class FakeGitHub:
         )
 
     async def read_blob(self, sha):
+        self.reads += 1
         return self.blobs[sha].decode()
 
     async def create_commit(self, head, tree, files, title):
@@ -361,3 +369,151 @@ def test_google_callback_creates_only_allowed_sessions(monkeypatch, setup):
     assert "must-never-reach-browser" not in response.headers["set-cookie"]
     current = client.get("/studio/api/session")
     assert current.status_code == 200 and current.json()["email"] == settings.allowed_email
+
+
+def png_bytes(color="red"):
+    buffer = io.BytesIO()
+    Image.new("RGB", (2, 2), color).save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+def test_delete_draft_removes_private_copy_and_images(setup):
+    client, db, github, _ = setup
+    login(client, db)
+    draft = client.post("/studio/api/drafts", json=new_post()).json()
+    asset = client.post(
+        f"/studio/api/drafts/{draft['id']}/assets", files={"file": ("a.png", png_bytes(), "image/png")}
+    ).json()
+    assert client.get(asset["preview"]).status_code == 200
+    assert client.delete(f"/studio/api/drafts/{draft['id']}").status_code == 200
+    assert client.get(f"/studio/api/drafts/{draft['id']}").status_code == 404
+    assert client.get(asset["preview"]).status_code == 404
+    assert client.delete(f"/studio/api/drafts/{draft['id']}").status_code == 404
+    # Deleting the working copy of a published article never touches GitHub.
+    imported = client.post("/studio/api/posts/import", json={"path": PATH}).json()
+    assert client.delete(f"/studio/api/drafts/{imported['id']}").json()["source_path"] == PATH
+    assert PATH in github.files
+    assert client.post("/studio/api/posts/import", json={"path": PATH}).json()["id"] != imported["id"]
+    # A publish whose outcome is still unknown must be confirmed before deletion.
+    draft = client.post("/studio/api/drafts", json=new_post()).json()
+    github.lose_response = True
+    assert client.post(f"/studio/api/drafts/{draft['id']}/publish", json={"revision": 1}).status_code == 502
+    assert client.delete(f"/studio/api/drafts/{draft['id']}").status_code == 409
+    assert client.post(f"/studio/api/drafts/{draft['id']}/publish", json={"revision": 1}).status_code == 200
+    assert client.delete(f"/studio/api/drafts/{draft['id']}").status_code == 200
+
+
+def test_posts_listing_reads_titles_only_for_one_category(setup):
+    client, db, github, _ = setup
+    login(client, db)
+    github.add_file(
+        "content/try-tech/2026-01-15-sample.md",
+        b"---\ntitle: sample\ndraft: true\ndate: 2026-01-15\ncategory: try-tech\n---\nsample\n",
+    )
+    github.add_file("content/book-reviews/broken.md", b"no frontmatter")
+    listing = client.get("/studio/api/posts").json()
+    assert github.reads == 0
+    assert {(item["category"], item["slug"], item["date"], item["title"]) for item in listing} == {
+        ("memoir", "2025-03-SWMaestro", None, None),
+        ("try-tech", "sample", "2026-01-15", None),
+        ("book", "broken", None, None),
+    }
+    memoir = client.get("/studio/api/posts", params={"category": "memoir"}).json()
+    assert github.reads == 1
+    assert memoir == [
+        {
+            "path": PATH,
+            "category": "memoir",
+            "slug": "2025-03-SWMaestro",
+            "date": "2025-03-31",
+            "title": "기존 글",
+            "draft": False,
+        }
+    ]
+    assert client.get("/studio/api/posts", params={"category": "try-tech"}).json()[0]["draft"] is True
+    assert client.get("/studio/api/posts", params={"category": "book"}).json()[0]["error"]
+    assert client.get("/studio/api/posts", params={"category": "nope"}).status_code == 400
+
+
+def test_import_by_public_url(setup):
+    client, db, github, _ = setup
+    login(client, db)
+    draft = client.post(
+        "/studio/api/posts/import", json={"url": "https://www.gaeng02.com/memoir/2025-03-SWMaestro"}
+    ).json()
+    assert draft["source_path"] == PATH
+    same = client.post("/studio/api/posts/import", json={"url": "/memoir/2025-03-SWMaestro/"}).json()
+    assert same["id"] == draft["id"]
+    github.add_file("content/try-tech/2025-04-01-새-글.md", SOURCE.replace("memoir", "try-tech").encode())
+    korean = client.post(
+        "/studio/api/posts/import", json={"url": "https://www.gaeng02.com/try-tech/%EC%83%88-%EA%B8%80"}
+    )
+    assert korean.status_code == 200, korean.text
+    assert korean.json()["source_path"] == "content/try-tech/2025-04-01-새-글.md"
+    for url, status in [
+        ("https://evil.example/memoir/2025-03-SWMaestro", 400),
+        ("http://www.gaeng02.com/memoir/2025-03-SWMaestro", 400),
+        ("https://www.gaeng02.com/memoir/missing", 404),
+        ("https://www.gaeng02.com/about", 400),
+        ("https://www.gaeng02.com/admin/../memoir/2025-03-SWMaestro", 400),
+    ]:
+        assert client.post("/studio/api/posts/import", json={"url": url}).status_code == status, url
+    assert client.post("/studio/api/posts/import", json={}).status_code == 400
+
+
+def test_image_names_are_content_hashes_shared_across_drafts(setup):
+    client, db, _, _ = setup
+    login(client, db)
+    first = client.post("/studio/api/drafts", json=new_post()).json()
+    second = client.post("/studio/api/drafts", json={**new_post(), "slug": "second"}).json()
+    data = png_bytes()
+    expected = f"/assets/images/{hashlib.sha256(data).hexdigest()[:16]}.png"
+    uploads = [
+        client.post(
+            f"/studio/api/drafts/{first['id']}/assets", files={"file": ("사진 1.PNG", data, "image/png")}
+        ),
+        client.post(
+            f"/studio/api/drafts/{first['id']}/assets", files={"file": ("again.png", data, "image/png")}
+        ),
+        client.post(
+            f"/studio/api/drafts/{second['id']}/assets", files={"file": ("copy.png", data, "image/png")}
+        ),
+    ]
+    assert all(response.status_code == 200 for response in uploads)
+    assert {response.json()["path"] for response in uploads} == {expected}
+    assert len(client.get(f"/studio/api/drafts/{first['id']}/assets").json()) == 1
+    assert len(client.get(f"/studio/api/drafts/{second['id']}/assets").json()) == 1
+    other = client.post(
+        f"/studio/api/drafts/{first['id']}/assets", files={"file": ("b.png", png_bytes("blue"), "image/png")}
+    ).json()
+    assert other["path"] != expected and re.fullmatch(r"/assets/images/[0-9a-f]{16}\.png", other["path"])
+    assert client.get(uploads[0].json()["preview"]).content == data
+
+
+def test_version_1_database_migrates_assets_to_composite_key(tmp_path):
+    from app.db import Database
+
+    path = tmp_path / "studio.sqlite3"
+    old = sqlite3.connect(path)
+    old.executescript("""
+        CREATE TABLE sessions (hash TEXT PRIMARY KEY, email TEXT NOT NULL, subject TEXT NOT NULL,
+            csrf TEXT NOT NULL, expires INTEGER NOT NULL);
+        CREATE TABLE drafts (id TEXT PRIMARY KEY, revision INTEGER NOT NULL, post TEXT NOT NULL,
+            source_path TEXT UNIQUE, source_sha TEXT, original TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL, published_revision INTEGER, commit_sha TEXT, pending TEXT);
+        CREATE TABLE assets (name TEXT PRIMARY KEY, draft_id TEXT NOT NULL REFERENCES drafts(id),
+            mime TEXT NOT NULL, data BLOB NOT NULL);
+        INSERT INTO drafts (id, revision, post, updated_at) VALUES ('a', 1, '{}', 'now'), ('b', 1, '{}', 'now');
+        INSERT INTO assets VALUES ('studio-old.png', 'a', 'image/png', X'00');
+        PRAGMA user_version=1;
+    """)
+    old.close()
+    db = Database(path)
+    with db.connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert [row["name"] for row in connection.execute("SELECT name FROM assets")] == ["studio-old.png"]
+        connection.execute(
+            "INSERT INTO assets (name, draft_id, mime, data) VALUES ('studio-old.png', 'b', 'image/png', X'00')"
+        )
+    assert len(db.assets("b")) == 1 and db.asset("studio-old.png")["draft_id"] == "a"
+    assert Database(path).asset("studio-old.png") is not None
