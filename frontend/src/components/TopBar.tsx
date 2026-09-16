@@ -1,6 +1,7 @@
 import type { Draft, Session } from '../api'
 import type { Theme, ViewMode } from '../App'
 import { MenuIcon, MoonIcon, SunIcon } from './Icons'
+import logo from '../assets/logo.png'
 
 const VIEWS: { key: ViewMode; label: string }[] = [
   { key: 'write', label: '편집' },
@@ -48,6 +49,7 @@ export default function TopBar({
         <MenuIcon />
       </button>
       <a className="brand" href="/studio/" aria-label="BlogStudio 홈">
+        <img className="brand-mark" src={logo} alt="" />
         <span className="brand-name">Trace of Thought</span>
         <span className="brand-studio">Studio</span>
       </a>
