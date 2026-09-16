@@ -329,7 +329,7 @@ a {
   justify-content: space-between;
   gap: 12px;
   align-items: center;
-  max-width: 1120px;
+  max-width: 1800px;
   margin: 0 auto 16px;
 }
 .toast {
@@ -854,7 +854,7 @@ a {
 .main {
   overflow-y: auto;
   min-height: 0;
-  padding: 24px 28px 64px;
+  padding: 24px 32px 64px;
   background: var(--bg);
 }
 .scrim {
@@ -946,8 +946,10 @@ a {
 /* =========================================================
    EDITOR DOCUMENT
    ========================================================= */
+/* The editor uses the full width beside the sidebar: write + preview side by side need the room. */
 .doc {
-  max-width: 1120px;
+  width: 100%;
+  max-width: 1800px;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
