@@ -22,26 +22,30 @@ class GitHub:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.base = f"https://api.github.com/repos/{quote(settings.github_owner, safe='')}/{quote(settings.github_repo, safe='')}"
+        # One pooled client for the app's lifetime: each action makes several calls in a row,
+        # and a client per call paid a new TLS handshake and certificate load every time.
+        self.client: httpx.AsyncClient | None = None
 
     async def request(self, method: str, path: str, **kwargs):
         if not self.settings.github_token:
             raise GitHubError("GitHub 발행 권한이 아직 설정되지 않았습니다.", 503)
-        async with httpx.AsyncClient(timeout=30) as client:
-            try:
-                response = await client.request(
-                    method,
-                    self.base + path,
-                    headers={
-                        "Authorization": f"Bearer {self.settings.github_token}",
-                        "Accept": "application/vnd.github+json",
-                        "X-GitHub-Api-Version": "2022-11-28",
-                    },
-                    **kwargs,
-                )
-            except httpx.RequestError as error:
-                raise GitHubError(
-                    "GitHub 응답을 확인하지 못했습니다. 초안은 보존됩니다. 다시 시도해 주세요."
-                ) from error
+        if self.client is None:
+            self.client = httpx.AsyncClient(timeout=30)
+        try:
+            response = await self.client.request(
+                method,
+                self.base + path,
+                headers={
+                    "Authorization": f"Bearer {self.settings.github_token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                **kwargs,
+            )
+        except httpx.RequestError as error:
+            raise GitHubError(
+                "GitHub 응답을 확인하지 못했습니다. 초안은 보존됩니다. 다시 시도해 주세요."
+            ) from error
         if response.status_code in {409, 422}:
             raise GitHubError(
                 "GitHub 내용 또는 브랜치 규칙과 충돌했습니다. 최신 상태를 확인한 뒤 다시 시도해 주세요.", 409
@@ -52,16 +56,29 @@ class GitHub:
             )
         return response.json()
 
+    async def close(self):
+        if self.client is not None:
+            await self.client.aclose()
+            self.client = None
+
+    async def files(self, tree: str) -> dict:
+        """All files of a tree, given its SHA or a branch name, in one request."""
+        result = await self.request("GET", f"/git/trees/{quote(tree, safe='')}?recursive=1")
+        if result.get("truncated"):
+            raise GitHubError("저장소의 파일 목록이 너무 커 전체 내용을 읽지 못했습니다.")
+        return {entry["path"]: entry for entry in result["tree"]}
+
+    async def branch_files(self) -> dict:
+        """Current files for reads that need no parent commit, such as opening an article."""
+        return await self.files(self.settings.github_branch)
+
     async def snapshot(self):
         branch = quote(self.settings.github_branch, safe="")
-        ref = await self.request("GET", f"/git/ref/heads/{branch}")
-        head = ref["object"]["sha"]
-        commit = await self.request("GET", f"/git/commits/{head}")
-        tree_sha = commit["tree"]["sha"]
-        tree = await self.request("GET", f"/git/trees/{tree_sha}?recursive=1")
-        if tree.get("truncated"):
-            raise GitHubError("저장소의 파일 목록이 너무 커 전체 내용을 읽지 못했습니다.")
-        return head, tree_sha, {entry["path"]: entry for entry in tree["tree"]}
+        # The branch response names both the head commit and its tree: one request fewer.
+        found = await self.request("GET", f"/branches/{branch}")
+        head = found["commit"]["sha"]
+        tree_sha = found["commit"]["commit"]["tree"]["sha"]
+        return head, tree_sha, await self.files(tree_sha)
 
     async def read_blob(self, sha: str) -> str:
         result = await self.request("GET", f"/git/blobs/{sha}")

@@ -1,15 +1,20 @@
 export type Category = 'try-tech' | 'memoir' | 'paper' | 'book'
 export type Accent = 'try' | 'memoir' | 'paper' | 'book'
 
-export const CATEGORIES: { key: Category; label: string; accent: Accent }[] = [
-  { key: 'try-tech', label: '기술', accent: 'try' },
-  { key: 'memoir', label: '회고', accent: 'memoir' },
-  { key: 'paper', label: '논문', accent: 'paper' },
-  { key: 'book', label: '책', accent: 'book' },
+/** label: Korean UI name; blog: the name the published page shows on its badge. */
+export const CATEGORIES: { key: Category; label: string; blog: string; accent: Accent }[] = [
+  { key: 'try-tech', label: '기술', blog: 'Try Tech', accent: 'try' },
+  { key: 'memoir', label: '회고', blog: 'Memoir', accent: 'memoir' },
+  { key: 'paper', label: '논문', blog: 'Paper', accent: 'paper' },
+  { key: 'book', label: '책', blog: 'Book', accent: 'book' },
 ]
 
 export function categoryLabel(key: string): string {
   return CATEGORIES.find((item) => item.key === key)?.label ?? key
+}
+
+export function categoryBadge(key: string): string {
+  return CATEGORIES.find((item) => item.key === key)?.blog ?? key
 }
 
 export function categoryAccent(key: string): Accent {
@@ -36,16 +41,6 @@ export type Draft = {
   published_revision: number | null
   commit_sha: string | null
   publish_pending: boolean
-}
-
-export type PublishedEntry = {
-  path: string
-  category: Category
-  slug: string
-  date: string | null
-  title: string | null
-  draft: boolean | null
-  error?: string
 }
 
 export type Session = { email: string; csrf: string; blog_url: string }

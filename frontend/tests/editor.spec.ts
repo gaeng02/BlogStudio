@@ -1,5 +1,10 @@
 import { test, expect, type Page } from '@playwright/test'
 
+// Hand-written HTML in a post is kept verbatim; scripts in it never run in the editor.
+const RAW_BLOCK =
+  '<details><summary>접힌 항목</summary>안쪽</details>\n<script>window.previewUnsafe=true</script>'
+const ORIGINAL_BODY = `원본 문단입니다.  \n줄을 바꾼 문장\n\n${RAW_BLOCK}\n\n- 첫 항목\n- 둘째 항목\n`
+
 const SESSION = { email: 'sondin144@gmail.com', csrf: 'csrf', blog_url: 'https://www.gaeng02.com' }
 
 function publishedDraft() {
@@ -16,32 +21,13 @@ function publishedDraft() {
       category: 'memoir',
       date: '2025-03-31',
       slug: '2025-03-SWMaestro',
-      body: '원본 내용',
+      body: ORIGINAL_BODY,
       description: '글 설명',
       tags: ['회고'],
       cover: '',
     },
   }
 }
-
-const LIGHT_LIST = [
-  {
-    path: 'content/memoir/2025-03-SWMaestro.md',
-    category: 'memoir',
-    slug: '2025-03-SWMaestro',
-    date: null,
-    title: null,
-    draft: null,
-  },
-  {
-    path: 'content/try-tech/2026-01-15-sample.md',
-    category: 'try-tech',
-    slug: 'sample',
-    date: '2026-01-15',
-    title: null,
-    draft: null,
-  },
-]
 
 test('login screen uses Google and excludes search engines', async ({ page }) => {
   await page.route('**/studio/api/session', (route) =>
@@ -59,31 +45,21 @@ test('login screen uses Google and excludes search engines', async ({ page }) =>
   await page.screenshot({ path: 'test-results/login-mobile.png', fullPage: true })
 })
 
-test('browse published articles by category, sanitize the preview and recover an uncertain publish', async ({
+test('open a published article from its link, edit it in place and recover an uncertain publish', async ({
   page,
 }) => {
   let draft = publishedDraft()
   let saved = 0
   let publishRequests = 0
-  const categoryRequests: string[] = []
   await page.route('**/studio/api/**', async (route) => {
-    const url = new URL(route.request().url())
-    const path = url.pathname.replace('/studio/api', '')
+    const path = new URL(route.request().url()).pathname.replace('/studio/api', '')
     const method = route.request().method()
     if (path === '/session') return route.fulfill({ json: SESSION })
     if (path === '/drafts' && method === 'GET') return route.fulfill({ json: [] })
-    if (path === '/posts') {
-      const category = url.searchParams.get('category')
-      if (!category) return route.fulfill({ json: LIGHT_LIST })
-      categoryRequests.push(category)
-      if (category === 'memoir')
-        return route.fulfill({
-          json: [{ ...LIGHT_LIST[0], title: draft.post.title, date: '2025-03-31', draft: false }],
-        })
-      return route.fulfill({ json: [{ ...LIGHT_LIST[1], title: 'sample', draft: true }] })
-    }
     if (path === '/posts/import') {
-      expect(route.request().postDataJSON()).toEqual({ path: draft.source_path })
+      expect(route.request().postDataJSON()).toEqual({
+        url: 'https://www.gaeng02.com/memoir/2025-03-SWMaestro',
+      })
       return route.fulfill({ json: draft })
     }
     if (path.endsWith('/assets')) return route.fulfill({ json: [] })
@@ -107,25 +83,37 @@ test('browse published articles by category, sanitize the preview and recover an
   })
   await page.goto('/studio/')
   await expect(page.getByRole('heading', { name: '어떤 생각을 남길까요?' })).toBeVisible()
-  await page.getByRole('button', { name: '글 목록 불러오기' }).click()
-  // The tree listing is grouped by category; titles are fetched for one category at a time.
-  await expect(page.getByRole('tab', { name: /기술.*1/ })).toHaveAttribute('aria-selected', 'true')
-  await expect(page.getByRole('button', { name: /sample.*미발행 파일/ })).toBeVisible()
-  await page.getByRole('tab', { name: /회고/ }).click()
-  await expect(page.getByRole('button', { name: /기존 글.*2025-03-31.*수정하기/ })).toBeVisible()
-  expect(categoryRequests).toEqual(['try-tech', 'memoir'])
-  await page.getByRole('button', { name: /기존 글.*수정하기/ }).click()
+  // Published articles are opened from their link only; GitHub is never browsed.
+  await page.getByRole('button', { name: '발행된 글 고치기' }).click()
+  await expect(page.getByLabel('글 주소로 불러오기')).toBeFocused()
+  await page.keyboard.type('https://www.gaeng02.com/memoir/2025-03-SWMaestro')
+  await page.keyboard.press('Enter')
+  await expect(page.getByLabel('제목', { exact: true })).toHaveValue('기존 글')
   await expect(page.getByLabel('글 주소', { exact: true })).toBeDisabled()
   await expect(page.getByLabel('최초 발행일', { exact: true })).toBeDisabled()
-  await page.getByLabel('제목', { exact: true }).fill('수정한 글')
-  await page
-    .getByRole('textbox', { name: 'Markdown 본문' })
-    .fill(
-      '## 수정 내용\n\n<script>window.previewUnsafe=true</script>\n\n<details><summary>접힌 항목</summary>안쪽</details>\n\n본문입니다.'
-    )
-  await expect(page.locator('.prose h2')).toHaveText('수정 내용')
-  await expect(page.locator('.prose details summary')).toHaveText('접힌 항목')
+  // The body is edited as it will look on the blog; the HTML block renders, sanitized.
+  const body = page.getByRole('textbox', { name: '본문' })
+  await expect(body.locator('.raw-html summary')).toHaveText('접힌 항목')
+  await expect(body.locator('ul li')).toHaveCount(2)
   expect(await page.evaluate(() => (window as any).previewUnsafe)).toBeUndefined()
+  // Opening an article without editing it leaves its Markdown untouched.
+  await expect(page.locator('.sheet-state')).toHaveText('발행된 글')
+  await page.getByLabel('제목', { exact: true }).fill('수정한 글')
+  // Enter in the title moves to the start of the body, like a Notion page.
+  await page.getByLabel('제목', { exact: true }).press('Enter')
+  await expect(body).toBeFocused()
+  const second = body.getByText('둘째 항목')
+  const box = (await second.boundingBox())!
+  await second.click({ position: { x: box.width - 1, y: box.height / 2 } })
+  await page.waitForTimeout(100) // ProseMirror applies a clicked caret position a moment after mouseup
+  await page.keyboard.press('Enter')
+  await page.keyboard.type('셋째 **굵게**')
+  await expect(body.locator('ul li strong')).toHaveText('굵게')
+  // Markdown shortcuts work as in Notion: an empty item leaves the list, "## " makes a heading.
+  await page.keyboard.press('Enter')
+  await page.keyboard.press('Enter')
+  await page.keyboard.type('## 맺음말')
+  await expect(body.locator('h2')).toHaveText('맺음말')
   await page.getByRole('button', { name: '수정 발행', exact: true }).click()
   await expect(page.getByRole('alert')).toContainText('GitHub 응답 확인 실패')
   await expect(page.getByRole('button', { name: '수정 발행', exact: true })).toBeEnabled()
@@ -133,6 +121,9 @@ test('browse published articles by category, sanitize the preview and recover an
   await expect(page.getByRole('status')).toContainText('GitHub에 반영했습니다')
   expect(saved).toBe(1)
   expect(publishRequests).toBe(2)
+  expect(draft.post.body).toBe(
+    `원본 문단입니다.\\\n줄을 바꾼 문장\n\n${RAW_BLOCK}\n\n- 첫 항목\n- 둘째 항목\n- 셋째 **굵게**\n\n## 맺음말\n`
+  )
   expect(draft.post.slug).toBe('2025-03-SWMaestro')
   expect(draft.post.date).toBe('2025-03-31')
   await page.screenshot({ path: 'test-results/editor-published.png', fullPage: true })

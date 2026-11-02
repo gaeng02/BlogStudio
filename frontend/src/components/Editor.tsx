@@ -1,28 +1,83 @@
-import {
-  useRef,
-  useState,
-  type ChangeEvent,
-  type ClipboardEvent,
-  type DragEvent,
-  type RefObject,
-} from 'react'
-import { CATEGORIES, categoryAccent, categoryLabel, type Asset, type Draft, type Post } from '../api'
+import { useCallback, useEffect, useRef, type ChangeEvent } from 'react'
+import { EditorContent, useEditor, useEditorState, type Editor as TiptapEditor } from '@tiptap/react'
+import { BubbleMenu } from '@tiptap/react/menus'
+import StarterKit from '@tiptap/starter-kit'
+import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table'
+import { Placeholder } from '@tiptap/extensions'
+import { Selection } from '@tiptap/pm/state'
+import { CATEGORIES, categoryAccent, categoryBadge, type Asset, type Draft, type Post } from '../api'
 import { countText } from '../markdown'
-import type { ViewMode } from '../App'
+import { editorToMarkdown, markdownToEditorHtml } from '../editor/convert'
+import { PostImage, RawHtml, ResolverProvider, SlashCommand } from '../editor/extensions'
 import TagInput from './TagInput'
 import { ExternalIcon, ImageIcon, LinkIcon, RefreshIcon } from './Icons'
 
-type Format = 'bold' | 'italic' | 'heading' | 'quote' | 'code' | 'link' | 'list'
+export type UploadedImage = Asset & { alt: string }
 
-const FORMATS: { key: Format; label: string; title: string }[] = [
-  { key: 'heading', label: 'H2', title: '소제목' },
-  { key: 'bold', label: 'B', title: '굵게' },
-  { key: 'italic', label: 'I', title: '기울임' },
-  { key: 'quote', label: '“', title: '인용' },
-  { key: 'code', label: '<>', title: '코드' },
-  { key: 'link', label: 'link', title: '링크' },
-  { key: 'list', label: '•', title: '목록' },
-]
+function AutoTextarea(props: React.TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  const ref = useRef<HTMLTextAreaElement>(null)
+  useEffect(() => {
+    const area = ref.current
+    if (!area) return
+    area.style.height = 'auto'
+    area.style.height = `${area.scrollHeight}px`
+  }, [props.value])
+  return <textarea ref={ref} rows={1} {...props} />
+}
+
+function FormatMenu({ editor }: { editor: TiptapEditor }) {
+  const state = useEditorState({
+    editor,
+    selector: ({ editor: e }) => ({
+      bold: e.isActive('bold'),
+      italic: e.isActive('italic'),
+      strike: e.isActive('strike'),
+      code: e.isActive('code'),
+      link: e.isActive('link'),
+      h2: e.isActive('heading', { level: 2 }),
+      h3: e.isActive('heading', { level: 3 }),
+      quote: e.isActive('blockquote'),
+    }),
+  })
+  const chain = () => editor.chain().focus()
+  const buttons: { key: keyof typeof state; label: string; title: string; run: () => void }[] = [
+    { key: 'h2', label: 'H2', title: '제목', run: () => chain().toggleHeading({ level: 2 }).run() },
+    { key: 'h3', label: 'H3', title: '소제목', run: () => chain().toggleHeading({ level: 3 }).run() },
+    { key: 'bold', label: 'B', title: '굵게 (⌘B)', run: () => chain().toggleBold().run() },
+    { key: 'italic', label: 'I', title: '기울임 (⌘I)', run: () => chain().toggleItalic().run() },
+    { key: 'strike', label: 'S', title: '취소선', run: () => chain().toggleStrike().run() },
+    { key: 'code', label: '<>', title: '코드', run: () => chain().toggleCode().run() },
+    { key: 'quote', label: '“', title: '인용', run: () => chain().toggleBlockquote().run() },
+    {
+      key: 'link',
+      label: '',
+      title: '링크',
+      run: () => {
+        if (editor.isActive('link')) return chain().unsetLink().run()
+        const href = window.prompt('링크 주소', 'https://')
+        if (href && href !== 'https://') chain().extendMarkRange('link').setLink({ href }).run()
+      },
+    },
+  ]
+  return (
+    <BubbleMenu editor={editor} className="bubble" options={{ placement: 'top' }}>
+      {buttons.map((item) => (
+        <button
+          key={item.key}
+          type="button"
+          className={`bubble-btn bubble-${item.key}${state[item.key] ? ' is-active' : ''}`}
+          title={item.title}
+          aria-label={item.title}
+          aria-pressed={state[item.key]}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={item.run}
+        >
+          {item.key === 'link' ? <LinkIcon size={14} /> : item.label}
+        </button>
+      ))}
+    </BubbleMenu>
+  )
+}
 
 export default function Editor({
   draft,
@@ -30,13 +85,9 @@ export default function Editor({
   assets,
   busy,
   dirty,
-  view,
-  preview,
   blogUrl,
-  editorRef,
   onChange,
   onUpload,
-  onInsert,
   onReload,
 }: {
   draft: Draft
@@ -44,330 +95,314 @@ export default function Editor({
   assets: Asset[]
   busy: boolean
   dirty: boolean
-  view: ViewMode
-  preview: string
   blogUrl: string
-  editorRef: RefObject<HTMLTextAreaElement | null>
   onChange: <K extends keyof Post>(key: K, value: Post[K]) => void
-  onUpload: (files: File[]) => void
-  onInsert: (snippet: string) => void
+  onUpload: (files: File[]) => Promise<UploadedImage[]>
   onReload: () => void
 }) {
   const picker = useRef<HTMLInputElement>(null)
-  const [dragging, setDragging] = useState(false)
+  // The Markdown the editor last produced. An unedited post keeps its original text.
+  const emitted = useRef(post.body)
+  const upload = useRef(onUpload)
+  upload.current = onUpload
   const locked = !!draft.source_path
   const publicUrl = `${blogUrl}/${post.category}/${encodeURIComponent(post.slug)}`
-  const { chars, words } = countText(post.body)
-  const coverAsset = assets.find((item) => item.path === post.cover)
-  const coverPreview = coverAsset
-    ? coverAsset.preview
-    : post.cover.startsWith('/assets/')
-      ? blogUrl + post.cover
-      : post.cover
+  const { chars } = countText(post.body)
 
-  function applyFormat(kind: Format) {
-    const area = editorRef.current
-    if (!area) return
-    const { selectionStart: start, selectionEnd: end, value } = area
-    const selected = value.slice(start, end)
-    const lineStart = value.lastIndexOf('\n', start - 1) + 1
-    let next = value
-    let cursor = end
-    const wrap = (before: string, after: string, placeholder: string) => {
-      const text = selected || placeholder
-      next = value.slice(0, start) + before + text + after + value.slice(end)
-      cursor = start + before.length + text.length + (selected ? after.length : 0)
-    }
-    const prefixLines = (prefix: string) => {
-      const blockEnd = value.indexOf('\n', end) === -1 ? value.length : value.indexOf('\n', end)
-      const block = value.slice(lineStart, blockEnd)
-      const changed = block
-        .split('\n')
-        .map((line) => (line.startsWith(prefix) ? line.slice(prefix.length) : prefix + line))
-        .join('\n')
-      next = value.slice(0, lineStart) + changed + value.slice(blockEnd)
-      cursor = lineStart + changed.length
-    }
-    if (kind === 'bold') wrap('**', '**', '굵은 글씨')
-    else if (kind === 'italic') wrap('*', '*', '기울인 글씨')
-    else if (kind === 'code')
-      selected.includes('\n') ? wrap('```\n', '\n```', '코드') : wrap('`', '`', '코드')
-    else if (kind === 'link') wrap('[', '](https://)', '링크 텍스트')
-    else if (kind === 'heading') prefixLines('## ')
-    else if (kind === 'quote') prefixLines('> ')
-    else if (kind === 'list') prefixLines('- ')
-    onChange('body', next)
-    requestAnimationFrame(() => {
-      area.focus()
-      area.setSelectionRange(cursor, cursor)
-    })
+  const resolve = useCallback(
+    (src: string) => {
+      const asset = assets.find((item) => item.path === src)
+      if (asset) return asset.preview
+      return src.startsWith('/assets/') ? blogUrl + src : src
+    },
+    [assets, blogUrl]
+  )
+
+  const editor = useEditor({
+    extensions: [
+      StarterKit.configure({ underline: false, link: { openOnClick: false, autolink: true } }),
+      PostImage,
+      RawHtml,
+      Table.configure({ resizable: false }),
+      TableRow,
+      TableHeader,
+      TableCell,
+      Placeholder.configure({
+        placeholder: ({ node }) =>
+          node.type.name === 'heading' ? '제목' : "내용을 입력하거나 '/'로 블록 추가",
+      }),
+      SlashCommand.configure({ onImage: () => picker.current?.click() }),
+    ],
+    content: markdownToEditorHtml(post.body),
+    editorProps: {
+      attributes: {
+        class: 'prose body-prose',
+        role: 'textbox',
+        'aria-multiline': 'true',
+        'aria-label': '본문',
+        spellcheck: 'false',
+      },
+      handlePaste: (_view, event) => {
+        const files = Array.from(event.clipboardData?.files ?? []).filter((file) =>
+          file.type.startsWith('image/')
+        )
+        if (!files.length) return false
+        void insertImages(files)
+        return true
+      },
+      handleDrop: (view, event) => {
+        const files = Array.from(event.dataTransfer?.files ?? []).filter((file) =>
+          file.type.startsWith('image/')
+        )
+        if (!files.length) return false
+        event.preventDefault()
+        const position = view.posAtCoords({ left: event.clientX, top: event.clientY })?.pos
+        void insertImages(files, position)
+        return true
+      },
+    },
+    onUpdate: ({ editor: current }) => {
+      const markdown = editorToMarkdown(current.state.doc)
+      emitted.current = markdown
+      onChange('body', markdown)
+    },
+  })
+
+  async function insertImages(files: File[], position?: number) {
+    const uploaded = await upload.current(files)
+    if (!editor || !uploaded.length) return
+    const images = uploaded.map((item) => ({ type: 'image', attrs: { src: item.path, alt: item.alt } }))
+    const chain = editor.chain().focus()
+    ;(position === undefined ? chain.insertContent(images) : chain.insertContentAt(position, images)).run()
   }
 
-  function onDrop(event: DragEvent<HTMLElement>) {
-    setDragging(false)
-    if (event.dataTransfer.files.length) {
-      event.preventDefault()
-      onUpload(Array.from(event.dataTransfer.files))
-    }
-  }
-
-  function onPaste(event: ClipboardEvent<HTMLTextAreaElement>) {
-    const files = Array.from(event.clipboardData.files)
-    if (files.length) {
-      event.preventDefault()
-      onUpload(files)
-    }
-  }
+  // Replace the document when the body changes from outside (another draft, reload).
+  useEffect(() => {
+    if (!editor || post.body === emitted.current) return
+    emitted.current = post.body
+    editor.commands.setContent(markdownToEditorHtml(post.body), { emitUpdate: false })
+  }, [editor, post.body])
 
   function onPick(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files || [])
-    if (files.length) onUpload(files)
+    if (files.length) void insertImages(files)
     event.target.value = ''
   }
 
+  const coverPreview = post.cover ? resolve(post.cover) : ''
+
   return (
-    <div className="doc">
-      <header className="doc-head">
-        <div className="doc-kind">
-          <span className={`pill ${categoryAccent(post.category)}`}>{categoryLabel(post.category)}</span>
-          <span className="doc-kind-text">{locked ? '발행된 글 수정' : '새 글'}</span>
-          <span className={`doc-kind-state${dirty ? ' is-dirty' : ''}`}>
-            {dirty ? '저장하지 않은 수정 내용' : '초안 저장됨'}
-          </span>
-        </div>
-        <fieldset disabled={busy} className="doc-fields">
-          <input
-            className="doc-title"
-            aria-label="제목"
-            value={post.title}
-            onChange={(event) => onChange('title', event.target.value)}
-            placeholder="제목을 입력하세요"
-            maxLength={200}
-          />
-          <textarea
-            className="doc-desc"
-            aria-label="검색 결과에 표시할 설명"
-            value={post.description}
-            onChange={(event) => onChange('description', event.target.value)}
-            placeholder="검색 결과와 목록에 보일 한두 문장 설명"
-            rows={2}
-            maxLength={500}
-          />
-          <div className="doc-meta">
-            <label className="field">
-              <span className="field-label">카테고리</span>
+    <ResolverProvider resolve={resolve}>
+      <div className="doc">
+        <dl className="props" aria-label="글 정보">
+          <div className="prop">
+            <dt>카테고리</dt>
+            <dd>
               <select
                 aria-label="카테고리"
                 value={post.category}
-                disabled={locked}
+                disabled={locked || busy}
                 onChange={(event) => onChange('category', event.target.value)}
               >
                 {CATEGORIES.map((item) => (
                   <option key={item.key} value={item.key}>
-                    {item.label} · {item.key}
+                    {item.label}
                   </option>
                 ))}
               </select>
-            </label>
-            <label className="field field-slug">
-              <span className="field-label">글 주소</span>
-              <span className="slug-field">
-                <span className="slug-prefix">/{post.category}/</span>
-                <input
-                  aria-label="글 주소"
-                  value={post.slug}
-                  disabled={locked}
-                  onChange={(event) => onChange('slug', event.target.value)}
-                  placeholder="my-first-post"
-                  maxLength={120}
-                />
-              </span>
-            </label>
-            <label className="field">
-              <span className="field-label">최초 발행일</span>
+            </dd>
+          </div>
+          <div className="prop">
+            <dt>주소</dt>
+            <dd className="slug-field">
+              <span className="slug-prefix">/{post.category}/</span>
+              <input
+                aria-label="글 주소"
+                value={post.slug}
+                disabled={locked || busy}
+                onChange={(event) => onChange('slug', event.target.value)}
+                placeholder="my-first-post"
+                maxLength={120}
+              />
+            </dd>
+          </div>
+          <div className="prop">
+            <dt>발행일</dt>
+            <dd>
               <input
                 aria-label="최초 발행일"
                 type="date"
                 value={post.date}
-                disabled={locked}
+                disabled={locked || busy}
                 onChange={(event) => onChange('date', event.target.value)}
               />
-            </label>
-            <div className="field field-tags">
-              <span className="field-label">태그</span>
-              <TagInput value={post.tags} disabled={busy} onChange={(tags) => onChange('tags', tags)} />
-            </div>
-            <label className="field field-cover">
-              <span className="field-label">표지 이미지</span>
-              <span className="cover-field">
-                {post.cover && <img className="cover-thumb" src={coverPreview} alt="" />}
-                <input
-                  aria-label="표지 이미지 주소"
-                  value={post.cover}
-                  onChange={(event) => onChange('cover', event.target.value)}
-                  placeholder="https://… 또는 아래 첨부 이미지에서 '표지로 사용'"
-                  maxLength={2000}
-                />
-              </span>
-            </label>
+            </dd>
           </div>
-        </fieldset>
-        {locked && (
-          <p className="doc-hint">
-            기존 글의 주소·카테고리·최초 발행일은 유지됩니다.{' '}
-            <a href={publicUrl} target="_blank" rel="noopener noreferrer">
-              공개 글 확인 ↗
-            </a>
-          </p>
-        )}
+          <div className="prop">
+            <dt>표지</dt>
+            <dd className="cover-field">
+              {post.cover && <img className="cover-thumb" src={coverPreview} alt="" />}
+              <input
+                aria-label="표지 이미지 주소"
+                value={post.cover}
+                disabled={busy}
+                onChange={(event) => onChange('cover', event.target.value)}
+                placeholder="없음 — 첨부 이미지에서 '표지로 사용'"
+                maxLength={2000}
+              />
+            </dd>
+          </div>
+          <div className="prop prop-wide">
+            <dt>설명</dt>
+            <dd>
+              <AutoTextarea
+                className="prop-desc"
+                aria-label="검색 결과에 표시할 설명"
+                value={post.description}
+                disabled={busy}
+                onChange={(event) => onChange('description', event.target.value)}
+                placeholder="검색 결과와 공유 카드에 보일 한두 문장"
+                maxLength={500}
+              />
+            </dd>
+          </div>
+        </dl>
+
         {draft.publish_pending && (
           <p className="alert alert-warn">
             앞선 발행 결과를 확인해야 합니다. 발행 버튼을 다시 누르면 중복 발행 없이 결과를 확인합니다.
           </p>
         )}
-      </header>
 
-      <div className="doc-tools">
-        <div className="fmt" role="group" aria-label="서식">
-          {FORMATS.map((item) => (
-            <button
-              key={item.key}
-              type="button"
-              className="fmt-btn"
-              title={item.title}
-              aria-label={item.title}
+        <article className="sheet">
+          <header className="sheet-head">
+            {/* Same order as the published article: category and tags, title, then the date. */}
+            <div className="sheet-kicker">
+              <span className={`pill ${categoryAccent(post.category)}`}>{categoryBadge(post.category)}</span>
+              <TagInput value={post.tags} disabled={busy} onChange={(tags) => onChange('tags', tags)} />
+            </div>
+            <AutoTextarea
+              className="sheet-title"
+              aria-label="제목"
+              value={post.title}
               disabled={busy}
-              onClick={() => applyFormat(item.key)}
-            >
-              {item.key === 'link' ? <LinkIcon size={14} /> : item.label}
-            </button>
-          ))}
-        </div>
-        <span className="doc-tools-hint">Markdown · 이미지는 드래그하거나 붙여넣으면 자동 업로드</span>
-        <button type="button" className="btn btn-sm" disabled={busy} onClick={() => picker.current?.click()}>
-          <ImageIcon size={15} />
-          이미지 추가
-        </button>
-        <input
-          ref={picker}
-          hidden
-          type="file"
-          accept="image/png,image/jpeg,image/gif,image/webp"
-          multiple
-          onChange={onPick}
-        />
-      </div>
-
-      <div
-        className={`doc-body view-${view}${dragging ? ' is-dragging' : ''}`}
-        onDragOver={(event) => {
-          event.preventDefault()
-          if (!dragging) setDragging(true)
-        }}
-        onDragLeave={(event) => {
-          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false)
-        }}
-        onDrop={onDrop}
-      >
-        <section className="pane pane-write" aria-label="편집">
-          <textarea
-            aria-label="Markdown 본문"
-            className="body-editor"
-            ref={editorRef}
-            value={post.body}
-            disabled={busy}
-            onChange={(event) => onChange('body', event.target.value)}
-            onPaste={onPaste}
-            placeholder={'## 시작하며\n\n여기에 본문을 적습니다.'}
-            spellCheck={false}
-          />
-          <footer className="pane-foot">
-            <span>
-              {chars.toLocaleString()}자 · {words.toLocaleString()}단어
-            </span>
-            <span>⌘S 저장</span>
-          </footer>
-        </section>
-        <section className="pane pane-preview" aria-label="미리보기">
-          <article className="prose">
-            <p className="prose-kicker">
-              {categoryLabel(post.category)} · {post.date}
+              onChange={(event) => onChange('title', event.target.value.replace(/\n/g, ' '))}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && editor && !event.nativeEvent.isComposing) {
+                  event.preventDefault()
+                  // Move synchronously: the focus command waits a frame, so fast typing landed in the title.
+                  editor.view.dispatch(editor.state.tr.setSelection(Selection.atStart(editor.state.doc)))
+                  editor.view.focus()
+                }
+              }}
+              placeholder="제목 없음"
+              maxLength={200}
+            />
+            <p className="sheet-date">
+              <time dateTime={post.date}>{post.date.replaceAll('-', '.')}</time>
+              <span className={`sheet-state${dirty ? ' is-dirty' : ''}`}>
+                {dirty ? '저장하지 않은 수정' : locked ? '발행된 글' : '초안'}
+              </span>
             </p>
-            <h1 className="prose-title">{post.title || '제목을 입력하세요'}</h1>
-            {post.description && <p className="prose-lede">{post.description}</p>}
-            <div dangerouslySetInnerHTML={{ __html: preview }} />
-          </article>
-        </section>
-        <div className="drop-overlay" aria-hidden="true">
-          <ImageIcon size={28} />
-          <span>이미지를 놓으면 본문에 추가됩니다</span>
-        </div>
-      </div>
+          </header>
 
-      {assets.length > 0 && (
-        <section className="attachments" aria-label="첨부 이미지">
-          <div className="side-head">
-            <span className="label">첨부 이미지</span>
-            <span className="count">{assets.length}</span>
-          </div>
-          <ul className="attachment-list">
-            {assets.map((asset) => (
-              <li key={asset.path} className={`attachment${post.cover === asset.path ? ' is-cover' : ''}`}>
-                <img src={asset.preview} alt="" />
-                <div className="attachment-body">
-                  <code>{asset.path.replace('/assets/images/', '')}</code>
-                  <div className="attachment-actions">
-                    <button
-                      type="button"
-                      className="btn-link"
-                      disabled={busy}
-                      onClick={() => onInsert(`\n![이미지 설명](${asset.path})\n`)}
-                    >
-                      본문에 삽입
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-link"
-                      disabled={busy}
-                      onClick={() => onChange('cover', post.cover === asset.path ? '' : asset.path)}
-                    >
-                      {post.cover === asset.path ? '표지 해제' : '표지로 사용'}
-                    </button>
+          {editor && <FormatMenu editor={editor} />}
+          <EditorContent editor={editor} className="sheet-body" />
+
+          <footer className="sheet-foot">
+            <span>{chars.toLocaleString()}자</span>
+            <span>&apos;/&apos; 블록 추가 · 글자를 선택하면 서식 · ⌘S 저장</span>
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              disabled={busy}
+              onClick={() => picker.current?.click()}
+            >
+              <ImageIcon size={15} />
+              이미지
+            </button>
+            <input
+              ref={picker}
+              hidden
+              type="file"
+              accept="image/png,image/jpeg,image/gif,image/webp"
+              multiple
+              onChange={onPick}
+            />
+          </footer>
+        </article>
+
+        {assets.length > 0 && (
+          <section className="attachments" aria-label="첨부 이미지">
+            <div className="side-head">
+              <span className="label">첨부 이미지</span>
+              <span className="count">{assets.length}</span>
+            </div>
+            <ul className="attachment-list">
+              {assets.map((asset) => (
+                <li key={asset.path} className={`attachment${post.cover === asset.path ? ' is-cover' : ''}`}>
+                  <img src={asset.preview} alt="" />
+                  <div className="attachment-body">
+                    <code>{asset.path.replace('/assets/images/', '')}</code>
+                    <div className="attachment-actions">
+                      <button
+                        type="button"
+                        className="btn-link"
+                        disabled={busy}
+                        onClick={() =>
+                          editor
+                            ?.chain()
+                            .focus()
+                            .insertContent({ type: 'image', attrs: { src: asset.path, alt: '' } })
+                            .run()
+                        }
+                      >
+                        본문에 삽입
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-link"
+                        disabled={busy}
+                        onClick={() => onChange('cover', post.cover === asset.path ? '' : asset.path)}
+                      >
+                        {post.cover === asset.path ? '표지 해제' : '표지로 사용'}
+                      </button>
+                    </div>
                   </div>
-                </div>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
 
-      {locked && (
-        <footer className="doc-foot">
-          <a className="btn btn-ghost btn-sm" href={publicUrl} target="_blank" rel="noopener noreferrer">
-            <ExternalIcon size={14} />
-            공개 글 확인 ↗
-          </a>
-          <a
-            className="btn btn-ghost btn-sm"
-            href="https://github.com/gaeng02/gaeng02.github.io/actions"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <ExternalIcon size={14} />
-            배포 상태 확인 ↗
-          </a>
-          <span className="grow" />
-          <button
-            type="button"
-            className="btn btn-ghost btn-sm"
-            disabled={busy || draft.publish_pending}
-            onClick={onReload}
-          >
-            <RefreshIcon size={14} />
-            GitHub 최신 원본 다시 불러오기
-          </button>
-        </footer>
-      )}
-    </div>
+        {locked && (
+          <footer className="doc-foot">
+            <a className="btn btn-ghost btn-sm" href={publicUrl} target="_blank" rel="noopener noreferrer">
+              <ExternalIcon size={14} />
+              공개 글 확인 ↗
+            </a>
+            <a
+              className="btn btn-ghost btn-sm"
+              href="https://github.com/gaeng02/gaeng02.github.io/actions"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              <ExternalIcon size={14} />
+              배포 상태 확인 ↗
+            </a>
+            <span className="grow" />
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              disabled={busy || draft.publish_pending}
+              onClick={onReload}
+            >
+              <RefreshIcon size={14} />
+              GitHub 최신 원본 다시 불러오기
+            </button>
+          </footer>
+        )}
+      </div>
+    </ResolverProvider>
   )
 }

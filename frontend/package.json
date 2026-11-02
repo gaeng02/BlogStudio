@@ -9,6 +9,15 @@
     "test": "playwright test"
   },
   "dependencies": {
+    "@floating-ui/dom": "^1.8.0",
+    "@tiptap/extension-image": "^3.32.2",
+    "@tiptap/extension-table": "^3.32.2",
+    "@tiptap/extensions": "^3.32.2",
+    "@tiptap/pm": "^3.32.2",
+    "@tiptap/react": "^3.32.2",
+    "@tiptap/starter-kit": "^3.32.2",
+    "@tiptap/suggestion": "^3.32.2",
+    "prosemirror-markdown": "^1.13.9",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "rehype-raw": "^7.0.0",

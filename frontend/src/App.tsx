@@ -1,31 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import {
-  request,
-  newPost,
-  type Asset,
-  type Category,
-  type Draft,
-  type Post,
-  type PublishedEntry,
-  type Session,
-} from './api'
-import { renderPreview } from './markdown'
+import { request, newPost, type Asset, type Draft, type Post, type Session } from './api'
 import LoginScreen from './components/LoginScreen'
 import TopBar from './components/TopBar'
 import Sidebar from './components/Sidebar'
-import Editor from './components/Editor'
+import Editor, { type UploadedImage } from './components/Editor'
 import EmptyState from './components/EmptyState'
 
-export type ViewMode = 'write' | 'split' | 'preview'
 export type Theme = 'light' | 'dark'
-
-function readStorage(key: string): string | null {
-  try {
-    return localStorage.getItem(key)
-  } catch {
-    return null
-  }
-}
 
 function writeStorage(key: string, value: string) {
   try {
@@ -50,20 +31,12 @@ export default function App() {
   const [draft, setDraft] = useState<Draft | null>(null)
   const [post, setPost] = useState<Post>(newPost)
   const [assets, setAssets] = useState<Asset[]>([])
-  const [preview, setPreview] = useState('')
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState('')
   const [error, setError] = useState('')
-  const [view, setViewState] = useState<ViewMode>(() => {
-    const stored = readStorage('studio.view')
-    return stored === 'write' || stored === 'preview' ? stored : 'split'
-  })
   const [theme, setThemeState] = useState<Theme>(currentTheme)
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [published, setPublished] = useState<PublishedEntry[] | null>(null)
-  const [category, setCategory] = useState<Category | null>(null)
-  const [titles, setTitles] = useState<Partial<Record<Category, PublishedEntry[]>>>({})
-  const editor = useRef<HTMLTextAreaElement>(null)
+  const linkInput = useRef<HTMLInputElement>(null)
   const dirty = draft !== null && JSON.stringify(post) !== JSON.stringify(draft.post)
 
   const api = useCallback(
@@ -137,33 +110,11 @@ export default function App() {
   }, [dirty])
 
   useEffect(() => {
-    let active = true
-    const blogUrl = session?.blog_url || ''
-    const timer = setTimeout(async () => {
-      const html = await renderPreview(post.body, (path) => {
-        const asset = assets.find((item) => item.path === path)
-        if (asset) return asset.preview
-        return path.startsWith('/assets/') ? blogUrl + path : path
-      })
-      if (active) setPreview(html)
-    }, 200)
-    return () => {
-      active = false
-      clearTimeout(timer)
-    }
-  }, [post.body, assets, session?.blog_url])
-
-  useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)')
     const sync = () => setThemeState(currentTheme())
     media.addEventListener('change', sync)
     return () => media.removeEventListener('change', sync)
   }, [])
-
-  function setView(next: ViewMode) {
-    setViewState(next)
-    writeStorage('studio.view', next)
-  }
 
   function toggleTheme() {
     const next: Theme = currentTheme() === 'dark' ? 'light' : 'dark'
@@ -220,16 +171,9 @@ export default function App() {
     setStatus('GitHub에 반영했습니다. 공개 블로그는 GitHub Actions 배포가 완료되면 갱신됩니다.')
   }
 
-  function insertAtCursor(snippet: string) {
-    const selection = editor.current?.selectionStart
-    setPost((current) => {
-      const position = selection ?? current.body.length
-      return { ...current, body: current.body.slice(0, position) + snippet + current.body.slice(position) }
-    })
-  }
-
-  async function upload(files: File[]) {
-    if (!draft) return
+  async function upload(files: File[]): Promise<UploadedImage[]> {
+    if (!draft) return []
+    const uploaded: UploadedImage[] = []
     const accepted = files.filter((file) => file.type.startsWith('image/'))
     if (!accepted.length) throw new Error('PNG, JPEG, GIF, WebP 이미지만 추가할 수 있습니다.')
     for (const file of accepted) {
@@ -242,9 +186,18 @@ export default function App() {
           .replace(/\.[^.]+$/, '')
           .replace(/[-_]+/g, ' ')
           .trim() || '이미지 설명'
-      insertAtCursor(`\n![${label}](${asset.path})\n`)
+      uploaded.push({ ...asset, alt: label })
     }
-    setStatus(`이미지를 추가했습니다. 파일명은 내용 해시로 자동 지정됩니다. 초안을 저장해 주세요.`)
+    setStatus('이미지를 추가했습니다. 초안을 저장해 주세요.')
+    return uploaded
+  }
+
+  async function uploadImages(files: File[]) {
+    let uploaded: UploadedImage[] = []
+    await run(async () => {
+      uploaded = await upload(files)
+    })
+    return uploaded
   }
 
   async function removeDraft(item: Draft) {
@@ -259,25 +212,9 @@ export default function App() {
     setStatus('초안을 삭제했습니다.')
   }
 
-  async function loadPublished() {
-    const list = await api<PublishedEntry[]>('/posts')
-    setPublished(list)
-    setTitles({})
-    const first =
-      category ?? (list.find((item) => item.category === 'try-tech')?.category || list[0]?.category || null)
-    if (first) await selectCategory(first, list)
-  }
-
-  async function selectCategory(key: Category, list: PublishedEntry[] | null = published) {
-    setCategory(key)
-    if (titles[key] || !list?.some((item) => item.category === key)) return
-    const detailed = await api<PublishedEntry[]>(`/posts?category=${encodeURIComponent(key)}`)
-    setTitles((current) => ({ ...current, [key]: detailed }))
-  }
-
-  async function importPost(input: { path?: string; url?: string }) {
+  async function importPost(url: string) {
     if (dirty && !window.confirm(UNSAVED)) return
-    const value = await api<Draft>('/posts/import', 'POST', input)
+    const value = await api<Draft>('/posts/import', 'POST', { url })
     const images = await api<Asset[]>(`/drafts/${value.id}/assets`)
     remember(value)
     setAssets(images)
@@ -304,7 +241,6 @@ export default function App() {
     setSession(null)
     leaveEditor()
     setDrafts([])
-    setPublished(null)
   }
 
   const saveDraft = () =>
@@ -343,9 +279,7 @@ export default function App() {
         draft={draft}
         dirty={dirty}
         busy={busy}
-        view={view}
         theme={theme}
-        onView={setView}
         onTheme={toggleTheme}
         onMenu={() => setSidebarOpen((open) => !open)}
         onSave={saveDraft}
@@ -361,12 +295,8 @@ export default function App() {
         onNew={() => run(createDraft)}
         onOpen={(item) => run(() => open(item))}
         onDelete={(item) => run(() => removeDraft(item))}
-        published={published}
-        category={category}
-        titles={titles}
-        onLoadPublished={() => run(loadPublished)}
-        onSelectCategory={(key) => run(() => selectCategory(key))}
-        onImport={(input) => run(() => importPost(input))}
+        linkRef={linkInput}
+        onImport={(url) => run(() => importPost(url))}
         email={session.email}
         theme={theme}
         onTheme={toggleTheme}
@@ -394,7 +324,7 @@ export default function App() {
             onOpen={(item) => run(() => open(item))}
             onBrowse={() => {
               setSidebarOpen(true)
-              if (!published) void run(loadPublished)
+              linkInput.current?.focus({ preventScroll: true })
             }}
           />
         ) : (
@@ -404,13 +334,9 @@ export default function App() {
             assets={assets}
             busy={busy}
             dirty={dirty}
-            view={view}
-            preview={preview}
             blogUrl={session.blog_url}
-            editorRef={editor}
             onChange={change}
-            onUpload={(files) => run(() => upload(files))}
-            onInsert={insertAtCursor}
+            onUpload={uploadImages}
             onReload={() => run(reloadOriginal)}
           />
         )}

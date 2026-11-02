@@ -1,22 +1,14 @@
 import type { Draft, Session } from '../api'
-import type { Theme, ViewMode } from '../App'
+import type { Theme } from '../App'
 import { MenuIcon, MoonIcon, SunIcon } from './Icons'
 import logo from '../assets/logo.png'
-
-const VIEWS: { key: ViewMode; label: string }[] = [
-  { key: 'write', label: '편집' },
-  { key: 'split', label: '나란히' },
-  { key: 'preview', label: '미리보기' },
-]
 
 export default function TopBar({
   session,
   draft,
   dirty,
   busy,
-  view,
   theme,
-  onView,
   onTheme,
   onMenu,
   onSave,
@@ -27,9 +19,7 @@ export default function TopBar({
   draft: Draft | null
   dirty: boolean
   busy: boolean
-  view: ViewMode
   theme: Theme
-  onView: (view: ViewMode) => void
   onTheme: () => void
   onMenu: () => void
   onSave: () => void
@@ -60,21 +50,6 @@ export default function TopBar({
         </div>
       )}
       <div className="topbar-actions">
-        {draft && (
-          <div className="seg" role="group" aria-label="보기 방식">
-            {VIEWS.map((item) => (
-              <button
-                key={item.key}
-                type="button"
-                className={`seg-btn${view === item.key ? ' is-active' : ''}`}
-                aria-pressed={view === item.key}
-                onClick={() => onView(item.key)}
-              >
-                {item.label}
-              </button>
-            ))}
-          </div>
-        )}
         {draft && (
           <>
             <button type="button" className="btn" disabled={busy} onClick={onSave} title="⌘S / Ctrl+S">

@@ -3,7 +3,6 @@ import hashlib
 import io
 import json
 import logging
-import re
 import secrets
 import time
 import uuid
@@ -44,13 +43,7 @@ class RevisionInput(BaseModel):
 
 
 class ImportInput(BaseModel):
-    path: str = Field(default="", max_length=1000)
     url: str = Field(default="", max_length=1000)
-
-
-def path_date(path: str) -> str | None:
-    match = re.match(r"(\d{4}-\d{2}-\d{2})-", path.rsplit("/", 1)[-1])
-    return match[1] if match else None
 
 
 def resolve_public_url(url: str, blog_url: str) -> tuple[str, str]:
@@ -95,6 +88,7 @@ def create_app(settings: Settings, github=None):
         with db.connect() as connection:
             connection.execute("DELETE FROM sessions WHERE expires < ?", (int(time.time()),))
         yield
+        await github.close()
 
     app = FastAPI(title="BlogStudio", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.db = db
@@ -138,8 +132,8 @@ def create_app(settings: Settings, github=None):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; script-src 'self'; "
-            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-            "font-src 'self' https://fonts.gstatic.com; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; "
+            "font-src 'self' https://fonts.gstatic.com https://cdn.jsdelivr.net; "
             "img-src 'self' https: data: blob:; connect-src 'self'; frame-ancestors 'none'; "
             "base-uri 'self'; form-action 'self'"
         )
@@ -311,8 +305,7 @@ def create_app(settings: Settings, github=None):
                 raise HTTPException(404, "GitHub에서 불러온 글이 아닙니다.")
             if draft["revision"] != data.revision or draft["pending"]:
                 raise HTTPException(409, "초안이 변경되었거나 발행 결과 확인이 필요합니다.")
-            _, _, tree = await github.snapshot()
-            entry = dict(article_entries(tree)).get(draft["source_path"])
+            entry = dict(article_entries(await github.branch_files())).get(draft["source_path"])
             if not entry:
                 raise HTTPException(409, "GitHub에서 원본이 삭제되었습니다. 현재 초안은 보존됩니다.")
             try:
@@ -347,72 +340,27 @@ def create_app(settings: Settings, github=None):
                 )
             return {"draft": public_draft(db.draft(draft_id)), "backup": public_draft(db.draft(backup_id))}
 
-    @app.get(PREFIX + "/api/posts", dependencies=[Depends(session)])
-    async def posts(category: str = ""):
-        """List published articles from the Git tree alone. Titles are read only for one
-        requested category, so opening the browser never downloads every article."""
-        if category and category not in CATEGORY_DIRS:
-            raise HTTPException(400, "허용되지 않은 카테고리입니다.")
-        _, _, tree = await github.snapshot()
-        entries = [
-            (path, entry)
-            for path, entry in article_entries(tree)
-            if not category or category_from_path(path) == category
-        ]
-        result = [
-            {
-                "path": path,
-                "category": category_from_path(path),
-                "slug": slug_from_path(path),
-                "date": path_date(path),
-                "title": None,
-                "draft": None,
-            }
-            for path, _ in entries
-        ]
-        if category:
-            semaphore = asyncio.Semaphore(5)
-
-            async def load(item, entry):
-                async with semaphore:
-                    try:
-                        post, meta = parse_post(item["path"], await github.read_blob(entry["sha"]))
-                        item.update(
-                            title=post.title, date=post.date.isoformat(), draft=meta.get("draft") is True
-                        )
-                    except (ValueError, UnicodeError):
-                        item.update(error="지원하지 않는 글 형식")
-
-            await asyncio.gather(*(load(item, entry) for item, (_, entry) in zip(result, entries)))
-        return sorted(result, key=lambda item: (item.get("date") or "", item["slug"]), reverse=True)
-
     @app.post(PREFIX + "/api/posts/import", dependencies=[Depends(session)])
     async def import_post(data: ImportInput):
-        if not data.path and not data.url:
-            raise HTTPException(400, "불러올 글의 경로나 주소를 입력해 주세요.")
+        if not data.url.strip():
+            raise HTTPException(400, "불러올 글의 주소를 입력해 주세요.")
+        category, slug = resolve_public_url(data.url, settings.blog_url)
+
+        def is_article(path: str) -> bool:
+            return category_from_path(path) == category and slug_from_path(path) == slug
+
         async with lock:
-            path = data.path
-            entries = None
-            if not path:
-                category, slug = resolve_public_url(data.url, settings.blog_url)
-                _, _, tree = await github.snapshot()
-                entries = dict(article_entries(tree))
-                path = next(
-                    (p for p in entries if category_from_path(p) == category and slug_from_path(p) == slug),
-                    None,
-                )
-                if not path:
-                    raise HTTPException(404, "해당 주소의 글을 GitHub에서 찾지 못했습니다.")
-            # Reopening an edited post resumes its draft; never discard unsaved work.
+            # Reopening an edited post resumes its draft without asking GitHub;
+            # never discard unsaved work.
             with db.connect() as connection:
-                existing = connection.execute("SELECT * FROM drafts WHERE source_path=?", (path,)).fetchone()
+                edited = connection.execute("SELECT * FROM drafts WHERE source_path IS NOT NULL").fetchall()
+            existing = next((row for row in edited if is_article(row["source_path"])), None)
             if existing:
                 return public_draft(db.decode(existing))
-            if entries is None:
-                _, _, tree = await github.snapshot()
-                entries = dict(article_entries(tree))
-            if path not in entries:
-                raise HTTPException(404, "글을 찾지 못했습니다.")
+            entries = dict(article_entries(await github.branch_files()))
+            path = next((path for path in entries if is_article(path)), None)
+            if not path:
+                raise HTTPException(404, "해당 주소의 글을 GitHub에서 찾지 못했습니다.")
             sha = entries[path]["sha"]
             try:
                 post, meta = parse_post(path, await github.read_blob(sha))

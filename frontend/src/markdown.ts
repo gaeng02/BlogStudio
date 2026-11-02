@@ -11,7 +11,7 @@ import rehypeStringify from 'rehype-stringify'
  * <img>, <details> and <table>; scripts, iframes, event handlers and inline styles are
  * removed. Keeping the schemas identical makes the preview match the published page.
  */
-const schema = {
+export const sanitizeSchema = {
   ...defaultSchema,
   attributes: {
     ...defaultSchema.attributes,
@@ -24,7 +24,7 @@ const processor = unified()
   .use(remarkGfm)
   .use(remarkRehype, { allowDangerousHtml: true })
   .use(rehypeRaw)
-  .use(rehypeSanitize, schema)
+  .use(rehypeSanitize, sanitizeSchema)
   .use(rehypeStringify)
 
 export async function renderPreview(

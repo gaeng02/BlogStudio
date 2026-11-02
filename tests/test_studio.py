@@ -15,6 +15,7 @@ from app.github import GitHub, GitHubError, blob_sha
 from app.main import COOKIE, allowed_identity, create_app
 
 PATH = "content/memoir/2025-03-SWMaestro.md"
+URL = "https://www.gaeng02.com/memoir/2025-03-SWMaestro"
 SOURCE = """---
 title: 기존 글
 date: "2025-03-31"
@@ -38,25 +39,32 @@ class FakeGitHub:
         self.lose_response = False
         self.move_before_advance = False
         self.blobs = {blob_sha(data): data for data in self.files.values()}
-        self.reads = 0
+        self.calls = []
 
     def add_file(self, path, data):
         self.files[path] = data
         self.blobs[blob_sha(data)] = data
 
+    def tree(self):
+        return {
+            path: {"sha": blob_sha(data), "type": "blob", "mode": "100644"}
+            for path, data in self.files.items()
+        }
+
     async def snapshot(self):
-        return (
-            self.head,
-            "tree",
-            {
-                path: {"sha": blob_sha(data), "type": "blob", "mode": "100644"}
-                for path, data in self.files.items()
-            },
-        )
+        self.calls.append("snapshot")
+        return self.head, "tree", self.tree()
+
+    async def branch_files(self):
+        self.calls.append("branch_files")
+        return self.tree()
 
     async def read_blob(self, sha):
-        self.reads += 1
+        self.calls.append("read_blob")
         return self.blobs[sha].decode()
+
+    async def close(self):
+        pass
 
     async def create_commit(self, head, tree, files, title):
         sha = f"commit-{len(self.commits)}"
@@ -123,7 +131,6 @@ def new_post():
 
 def test_private_routes_and_csrf(setup):
     client, db, _, _ = setup
-    assert client.get("/studio/api/posts").status_code == 401
     assert client.get("/studio/api/drafts").status_code == 401
     assert client.get("/studio/api/assets/file.png").status_code == 401
     assert client.post("/studio/api/drafts", json=new_post()).status_code == 403
@@ -180,7 +187,7 @@ def test_local_conflict_and_persistent_draft(setup):
 def test_edit_preserves_url_date_custom_fields_and_detects_remote_changes(setup):
     client, db, github, _ = setup
     login(client, db)
-    draft = client.post("/studio/api/posts/import", json={"path": PATH}).json()
+    draft = client.post("/studio/api/posts/import", json={"url": URL}).json()
     assert draft["post"]["slug"] == "2025-03-SWMaestro"
     assert (
         client.put(
@@ -191,7 +198,7 @@ def test_edit_preserves_url_date_custom_fields_and_detects_remote_changes(setup)
     )
     changed = {**draft["post"], "title": "수정한 제목", "body": "수정된 본문"}
     saved = client.put(f"/studio/api/drafts/{draft['id']}", json={"revision": 1, "post": changed}).json()
-    reopened = client.post("/studio/api/posts/import", json={"path": PATH}).json()
+    reopened = client.post("/studio/api/posts/import", json={"url": URL}).json()
     assert reopened["id"] == saved["id"] and reopened["post"]["body"] == "수정된 본문"
     response = client.post(f"/studio/api/drafts/{draft['id']}/publish", json={"revision": saved["revision"]})
     assert response.status_code == 200, response.text
@@ -272,8 +279,8 @@ def test_input_limits_paths_headers_and_logout(setup):
     for slug in ["../../etc/passwd", "/absolute", "a/b", "x?y", "x#y", "<script>"]:
         assert client.post("/studio/api/drafts", json={**new_post(), "slug": slug}).status_code == 422
     assert (
-        client.post("/studio/api/posts/import", json={"path": ".github/workflows/deploy.yml"}).status_code
-        == 404
+        client.post("/studio/api/posts/import", json={"url": "/.github/workflows/deploy.yml"}).status_code
+        == 400
     )
     response = client.get("/studio/api/drafts")
     assert "no-store" in response.headers["cache-control"]
@@ -318,6 +325,7 @@ def test_github_transport_writes_correct_atomic_tree(monkeypatch, setup):
             "parent", "base", {PATH: SOURCE.encode(), "public/assets/images/a.png": b"image"}, "제목"
         )
         await github.advance("new-commit")
+        await github.close()
 
     asyncio.run(execute())
     tree = next(payload for path, payload in requests if path.endswith("/trees"))
@@ -325,10 +333,47 @@ def test_github_transport_writes_correct_atomic_tree(monkeypatch, setup):
     assert requests[-1][1] == {"sha": "new-commit", "force": False}
 
 
+def test_github_transport_reuses_one_client_and_reads_the_branch_in_two_calls(monkeypatch, setup):
+    import asyncio
+
+    import httpx
+
+    _, _, _, settings = setup
+    settings.github_token = "test-token"
+    requests = []
+    clients = []
+
+    def handle(request):
+        requests.append(request.url.raw_path.decode().split("/gaeng02.github.io", 1)[1])
+        if request.url.path.endswith("/branches/main"):
+            return httpx.Response(200, json={"commit": {"sha": "head", "commit": {"tree": {"sha": "root"}}}})
+        entry = {"path": PATH, "sha": "blob", "type": "blob", "mode": "100644"}
+        return httpx.Response(200, json={"sha": "root", "truncated": False, "tree": [entry]})
+
+    original_client = httpx.AsyncClient
+
+    def client(**kwargs):
+        clients.append(original_client(transport=httpx.MockTransport(handle), **kwargs))
+        return clients[-1]
+
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    github = GitHub(settings)
+
+    async def execute():
+        head, tree_sha, files = await github.snapshot()
+        assert (head, tree_sha, list(files)) == ("head", "root", [PATH])
+        assert list(await github.branch_files()) == [PATH]
+        await github.close()
+
+    asyncio.run(execute())
+    assert requests == ["/branches/main", "/git/trees/root?recursive=1", "/git/trees/main?recursive=1"]
+    assert len(clients) == 1 and clients[0].is_closed
+
+
 def test_reload_preserves_a_backup_and_its_images(setup):
     client, db, github, _ = setup
     login(client, db)
-    draft = client.post("/studio/api/posts/import", json={"path": PATH}).json()
+    draft = client.post("/studio/api/posts/import", json={"url": URL}).json()
     buffer = io.BytesIO()
     Image.new("RGB", (2, 2)).save(buffer, "PNG")
     asset = client.post(
@@ -390,10 +435,10 @@ def test_delete_draft_removes_private_copy_and_images(setup):
     assert client.get(asset["preview"]).status_code == 404
     assert client.delete(f"/studio/api/drafts/{draft['id']}").status_code == 404
     # Deleting the working copy of a published article never touches GitHub.
-    imported = client.post("/studio/api/posts/import", json={"path": PATH}).json()
+    imported = client.post("/studio/api/posts/import", json={"url": URL}).json()
     assert client.delete(f"/studio/api/drafts/{imported['id']}").json()["source_path"] == PATH
     assert PATH in github.files
-    assert client.post("/studio/api/posts/import", json={"path": PATH}).json()["id"] != imported["id"]
+    assert client.post("/studio/api/posts/import", json={"url": URL}).json()["id"] != imported["id"]
     # A publish whose outcome is still unknown must be confirmed before deletion.
     draft = client.post("/studio/api/drafts", json=new_post()).json()
     github.lose_response = True
@@ -403,47 +448,23 @@ def test_delete_draft_removes_private_copy_and_images(setup):
     assert client.delete(f"/studio/api/drafts/{draft['id']}").status_code == 200
 
 
-def test_posts_listing_reads_titles_only_for_one_category(setup):
-    client, db, github, _ = setup
-    login(client, db)
-    github.add_file(
-        "content/try-tech/2026-01-15-sample.md",
-        b"---\ntitle: sample\ndraft: true\ndate: 2026-01-15\ncategory: try-tech\n---\nsample\n",
-    )
-    github.add_file("content/book-reviews/broken.md", b"no frontmatter")
-    listing = client.get("/studio/api/posts").json()
-    assert github.reads == 0
-    assert {(item["category"], item["slug"], item["date"], item["title"]) for item in listing} == {
-        ("memoir", "2025-03-SWMaestro", None, None),
-        ("try-tech", "sample", "2026-01-15", None),
-        ("book", "broken", None, None),
-    }
-    memoir = client.get("/studio/api/posts", params={"category": "memoir"}).json()
-    assert github.reads == 1
-    assert memoir == [
-        {
-            "path": PATH,
-            "category": "memoir",
-            "slug": "2025-03-SWMaestro",
-            "date": "2025-03-31",
-            "title": "기존 글",
-            "draft": False,
-        }
-    ]
-    assert client.get("/studio/api/posts", params={"category": "try-tech"}).json()[0]["draft"] is True
-    assert client.get("/studio/api/posts", params={"category": "book"}).json()[0]["error"]
-    assert client.get("/studio/api/posts", params={"category": "nope"}).status_code == 400
-
-
 def test_import_by_public_url(setup):
     client, db, github, _ = setup
     login(client, db)
-    draft = client.post(
-        "/studio/api/posts/import", json={"url": "https://www.gaeng02.com/memoir/2025-03-SWMaestro"}
-    ).json()
+    draft = client.post("/studio/api/posts/import", json={"url": URL}).json()
     assert draft["source_path"] == PATH
-    same = client.post("/studio/api/posts/import", json={"url": "/memoir/2025-03-SWMaestro/"}).json()
-    assert same["id"] == draft["id"]
+    # Opening by link reads the branch's file list and that one article: no commit snapshot.
+    assert github.calls == ["branch_files", "read_blob"]
+    for same in ["/memoir/2025-03-SWMaestro/", URL + "#1-지원서-검토", URL + "?from=search"]:
+        assert client.post("/studio/api/posts/import", json={"url": same}).json()["id"] == draft["id"]
+    # A post already being edited reopens from its draft without asking GitHub.
+    assert github.calls == ["branch_files", "read_blob"]
+    github.calls.clear()
+    changed = {**draft["post"], "body": "고친 본문"}
+    saved = client.put(f"/studio/api/drafts/{draft['id']}", json={"revision": 1, "post": changed}).json()
+    published = client.post(f"/studio/api/drafts/{draft['id']}/publish", json={"revision": saved["revision"]})
+    assert published.status_code == 200, published.text
+    assert github.calls == ["snapshot"]  # publishing still checks the latest commit
     github.add_file("content/try-tech/2025-04-01-새-글.md", SOURCE.replace("memoir", "try-tech").encode())
     korean = client.post(
         "/studio/api/posts/import", json={"url": "https://www.gaeng02.com/try-tech/%EC%83%88-%EA%B8%80"}

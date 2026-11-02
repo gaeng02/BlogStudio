@@ -1,5 +1,5 @@
 import { draftState, relativeTime, type Draft } from '../api'
-import { PlusIcon, SearchIcon } from './Icons'
+import { LinkIcon, PlusIcon } from './Icons'
 
 export default function EmptyState({
   drafts,
@@ -32,10 +32,10 @@ export default function EmptyState({
         </button>
         <button type="button" className="empty-card" disabled={busy} onClick={onBrowse}>
           <span className="empty-card-icon">
-            <SearchIcon size={20} />
+            <LinkIcon size={20} />
           </span>
           <span className="empty-card-title">발행된 글 고치기</span>
-          <span className="empty-card-desc">카테고리에서 고르거나 글 주소를 붙여넣어 불러옵니다.</span>
+          <span className="empty-card-desc">공개 블로그의 글 주소를 붙여넣으면 그 글을 불러옵니다.</span>
         </button>
       </div>
       {recent.length > 0 && (

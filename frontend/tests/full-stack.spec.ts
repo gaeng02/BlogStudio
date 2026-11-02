@@ -23,16 +23,17 @@ test('FastAPI persists drafts, serves private images, updates a published post a
   await page.getByLabel('태그', { exact: true }).fill('브라우저, 검증')
   await page.getByLabel('태그', { exact: true }).press('Enter')
   await expect(page.locator('.tag-chip')).toHaveCount(2)
-  await page.getByRole('textbox', { name: 'Markdown 본문' }).fill('## 첫 본문\n브라우저 검증 중입니다.')
+  const body = page.getByRole('textbox', { name: '본문' })
+  await body.click()
+  await page.keyboard.type('## 첫 본문')
+  await page.keyboard.press('Enter')
+  await page.keyboard.type('브라우저 검증 중입니다.')
+  await page.keyboard.press('Enter')
   await page
     .locator('input[type=file]')
     .setInputFiles({ name: 'pixel image.png', mimeType: 'image/png', buffer: PIXEL })
   await expect(page.getByRole('status')).toContainText('이미지를 추가했습니다')
-  await expect(page.locator('.prose img')).toBeVisible()
-  // Content-addressed file name, derived from the bytes rather than the upload name.
-  await expect(page.getByRole('textbox', { name: 'Markdown 본문' })).toHaveValue(
-    /!\[pixel image\]\(\/assets\/images\/[0-9a-f]{16}\.png\)/
-  )
+  await expect(body.locator('img')).toBeVisible()
   await page.getByRole('button', { name: '표지로 사용' }).click()
   await expect(page.getByLabel('표지 이미지 주소')).toHaveValue(/\/assets\/images\/[0-9a-f]{16}\.png/)
   await page.getByRole('button', { name: '초안 저장', exact: true }).click()
@@ -43,7 +44,15 @@ test('FastAPI persists drafts, serves private images, updates a published post a
     .getByRole('button', { name: /브라우저에서 작성한 글.*비공개 초안/ })
     .first()
     .click()
-  await expect(page.getByRole('textbox', { name: 'Markdown 본문' })).toContainText('브라우저 검증 중입니다.')
+  await expect(body).toContainText('브라우저 검증 중입니다.')
+  // Saved as Markdown, with a content-addressed image name derived from the bytes.
+  const saved = await page.evaluate(async () => {
+    const drafts = await (await fetch('/studio/api/drafts')).json()
+    return drafts[0].post.body as string
+  })
+  expect(saved).toMatch(
+    /^## 첫 본문\n\n브라우저 검증 중입니다\.\n\n!\[pixel image\]\(\/assets\/images\/[0-9a-f]{16}\.png\)\n$/
+  )
   await expect(page.locator('.tag-chip')).toHaveCount(2)
   await page.getByRole('button', { name: '발행', exact: true }).click()
   await expect(page.getByRole('status')).toContainText('GitHub에 반영했습니다')
@@ -55,10 +64,12 @@ test('FastAPI persists drafts, serves private images, updates a published post a
     'href',
     'https://www.gaeng02.com/try-tech/browser-post'
   )
-  await page.getByRole('button', { name: '글 목록 불러오기', exact: true }).click()
-  await expect(page.getByRole('tab', { name: /기술.*1/ })).toHaveAttribute('aria-selected', 'true')
-  await expect(page.getByRole('button', { name: /발행 후 수정한 글.*2025-04-01.*수정 중/ })).toBeVisible()
-  await expect(page.locator('.prose h2')).toHaveText('첫 본문')
+  // Pasting the link of a post that is being edited resumes that draft.
+  await page.getByLabel('글 주소로 불러오기').fill('https://www.gaeng02.com/try-tech/browser-post')
+  await page.getByRole('button', { name: '열기', exact: true }).click()
+  await expect(page.getByRole('status')).toContainText("'발행 후 수정한 글' 글을 불러왔습니다")
+  await expect(page.getByLabel('제목', { exact: true })).toHaveValue('발행 후 수정한 글')
+  await expect(body.locator('h2')).toHaveText('첫 본문')
   await page.getByRole('button', { name: '다크 모드로 전환' }).click()
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
   await page.screenshot({ path: 'test-results/editor-dark.png' })
@@ -72,5 +83,5 @@ test('FastAPI persists drafts, serves private images, updates a published post a
   await page.getByLabel('글 주소로 불러오기').fill('/try-tech/browser-post')
   await page.getByRole('button', { name: '열기', exact: true }).click()
   await expect(page.getByLabel('제목', { exact: true })).toHaveValue('발행 후 수정한 글')
-  await expect(page.locator('.prose img')).toBeVisible()
+  await expect(body.locator('img')).toBeVisible()
 })
